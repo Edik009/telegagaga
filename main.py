@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
 """
-Безопасная альтернатива личному user-account автоматизатору:
-- Telethon используется в режиме бота (BotFather token), а не для управления user-аккаунтом.
-- Рассылка выполняется только в явно разрешённые чаты (из конфига) или в чаты,
-  которые были явно зарегистрированы через команду бота администратором.
-- Намеренно НЕ поддерживаются:
-  * вход в личный Telegram-аккаунт по номеру телефона/коду;
-  * обход "всех активных чатов" user-аккаунта;
-  * управление пользовательскими сессиями Telethon для массовых рассылок.
-
-Это помогает избежать сценариев спама и проблем с безопасностью/правилами Telegram.
-
-Python: 3.9+
-Зависимость: telethon
+Telegram рассыльщик с авторизацией по номеру телефона.
+Управление через Telegram-бота.
+Python 3.9+
 """
 
 import asyncio
+import contextlib
 import json
 import logging
-import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from telethon import Button, TelegramClient, events
 from telethon.errors import (
@@ -32,68 +23,104 @@ from telethon.errors import (
     ChannelPrivateError,
     FloodWaitError,
     InputUserDeactivatedError,
+    MessageNotModifiedError,
     PeerIdInvalidError,
     RPCError,
-    SessionPasswordNeededError,
     UserBannedInChannelError,
     UserIsBlockedError,
 )
-
+from telethon.network.connection.tcpfull import ConnectionTcpFull
+from telethon.network.connection.tcpmtproxy import (
+    ConnectionTcpMTProxyRandomizedIntermediate,
+)
+from telethon.tl.functions.messages import DeleteHistoryRequest
+from telethon.tl.types import Channel, Chat
 
 # =========================
 # Конфигурация
 # =========================
-API_ID = int(os.getenv("TG_API_ID", "123456"))
-API_HASH = os.getenv("TG_API_HASH", "PUT_API_HASH_HERE")
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "PUT_BOT_TOKEN_HERE")
+API_ID = 20784926
+API_HASH = "2884cd0ca1ab0bbdef307767e2e2f1d0"
+SESSION_NAME = "user_session"
+CONTROL_BOT_TOKEN = "8292152730:AAEJOCpGqXG6U6xxV6qVyIMER0FbgYZiLLo"
 
-# ID Telegram-пользователя, которому разрешено управлять ботом.
-# Узнать свой ID можно у @userinfobot или аналогичных ботов.
-ADMIN_USER_IDS: Set[int] = {
-    int(value)
-    for value in os.getenv("TG_ADMIN_USER_IDS", "").split(",")
-    if value.strip()
-}
+ADMIN_USER_IDS = {8661926277}
 
-# Если включено, рассылка идёт только в эти чаты.
-# Формат: TG_ALLOWED_CHAT_IDS="-100123,-100456,777000"
-STRICT_ALLOWLIST_MODE = os.getenv("TG_STRICT_ALLOWLIST_MODE", "true").lower() == "true"
-ALLOWED_CHAT_IDS: Set[int] = {
-    int(value)
-    for value in os.getenv("TG_ALLOWED_CHAT_IDS", "").split(",")
-    if value.strip()
-}
+EXCLUDED_CHAT_IDS: Set[int] = set()
+SEND_TO_ALL_BY_DEFAULT = True
+ALLOWED_CHAT_IDS: Set[int] = set()
 
-# Файлы локального хранения.
-SESSION_NAME = os.getenv("TG_SESSION_NAME", "bot_session")
-STATE_FILE = Path(os.getenv("TG_STATE_FILE", "state.json"))
-LOG_LEVEL = os.getenv("TG_LOG_LEVEL", "INFO").upper()
+STATE_FILE = Path("state.json")
+LOG_LEVEL = "WARNING"
 
 DEFAULT_MESSAGE = "Привет! Это автоматическое сообщение по расписанию."
 DEFAULT_INTERVAL_SECONDS = 180
 
+# Анти-бан/анти-флуд задержки
+SEND_DELAY_RANGE = (45, 90)  # сек между успешными отправками
+CYCLE_DELAY_JITTER = (0.85, 1.25)  # множитель для паузы между циклами
+FLOOD_RETRY_BASE = 3
+FLOOD_RETRY_CAP = 5
 
-# =========================
-# Логирование
-# =========================
+PROXY_ENABLED = True
+PROXY_TYPE = "http"  # http, socks5, mtproto
+PROXY_HOST = "194.147.115.50"
+PROXY_PORT = 3128
+PROXY_USER = ""
+PROXY_PASS = ""
+MT_PROXY_SECRET = ""
+
+if PROXY_ENABLED and PROXY_TYPE == "mtproto":
+    CONNECTION = ConnectionTcpMTProxyRandomizedIntermediate
+else:
+    CONNECTION = ConnectionTcpFull
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("telegram_scheduler_bot")
+logger = logging.getLogger("telegram_scheduler")
+logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
 
 
 # =========================
 # Модель состояния
 # =========================
 @dataclass
+class Stats:
+    sent_ok: int = 0
+    send_errors: int = 0
+    flood_hits: int = 0
+    cycles_total: int = 0
+
+    def to_json(self) -> Dict[str, int]:
+        return {
+            "sent_ok": self.sent_ok,
+            "send_errors": self.send_errors,
+            "flood_hits": self.flood_hits,
+            "cycles_total": self.cycles_total,
+        }
+
+    @classmethod
+    def from_json(cls, payload: Dict[str, Any]) -> "Stats":
+        return cls(
+            sent_ok=int(payload.get("sent_ok", 0)),
+            send_errors=int(payload.get("send_errors", 0)),
+            flood_hits=int(payload.get("flood_hits", 0)),
+            cycles_total=int(payload.get("cycles_total", 0)),
+        )
+
+
+@dataclass
 class AppState:
     message_text: str = DEFAULT_MESSAGE
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
     sending_enabled: bool = False
     last_cycle_started_at: Optional[float] = None
-    registered_chat_ids: Set[int] = field(default_factory=set)
     last_errors: Dict[str, str] = field(default_factory=dict)
+    manual_chat_ids: Set[int] = field(default_factory=set)
+    banned_chats: Set[int] = field(default_factory=set)
+    stats: Stats = field(default_factory=Stats)
 
     def to_json(self) -> Dict[str, object]:
         return {
@@ -101,19 +128,29 @@ class AppState:
             "interval_seconds": self.interval_seconds,
             "sending_enabled": self.sending_enabled,
             "last_cycle_started_at": self.last_cycle_started_at,
-            "registered_chat_ids": sorted(self.registered_chat_ids),
             "last_errors": self.last_errors,
+            "manual_chat_ids": sorted(self.manual_chat_ids),
+            "banned_chats": sorted(self.banned_chats),
+            "stats": self.stats.to_json(),
         }
 
     @classmethod
     def from_json(cls, payload: Dict[str, object]) -> "AppState":
         return cls(
             message_text=str(payload.get("message_text") or DEFAULT_MESSAGE),
-            interval_seconds=max(10, int(payload.get("interval_seconds") or DEFAULT_INTERVAL_SECONDS)),
+            interval_seconds=max(
+                10,
+                int(payload.get("interval_seconds") or DEFAULT_INTERVAL_SECONDS),
+            ),
             sending_enabled=bool(payload.get("sending_enabled", False)),
             last_cycle_started_at=payload.get("last_cycle_started_at"),
-            registered_chat_ids={int(x) for x in payload.get("registered_chat_ids", [])},
-            last_errors={str(k): str(v) for k, v in dict(payload.get("last_errors") or {}).items()},
+            last_errors={
+                str(k): str(v)
+                for k, v in dict(payload.get("last_errors") or {}).items()
+            },
+            manual_chat_ids={int(x) for x in payload.get("manual_chat_ids", [])},
+            banned_chats={int(x) for x in payload.get("banned_chats", [])},
+            stats=Stats.from_json(dict(payload.get("stats") or {})),
         )
 
 
@@ -121,46 +158,38 @@ class StateStore:
     def __init__(self, path: Path):
         self.path = path
         self._lock = asyncio.Lock()
+        self.state: AppState = AppState()
 
     async def load(self) -> AppState:
         async with self._lock:
             if not self.path.exists():
-                return AppState()
+                self.state = AppState()
+                self.state.store = self
+                return self.state
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-                return AppState.from_json(data)
+                self.state = AppState.from_json(data)
+                self.state.store = self
+                return self.state
             except Exception as exc:
-                logger.exception("Не удалось прочитать %s: %s", self.path, exc)
-                broken_path = self.path.with_suffix(".broken.json")
-                try:
-                    self.path.replace(broken_path)
-                except OSError:
-                    logger.warning("Не удалось переименовать повреждённый файл состояния")
-                return AppState()
+                logger.exception("Ошибка чтения state.json: %s", exc)
+                self.state = AppState()
+                self.state.store = self
+                return self.state
 
     async def save(self, state: AppState) -> None:
         async with self._lock:
-            tmp_path = self.path.with_suffix(".tmp")
-            tmp_path.write_text(
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(
                 json.dumps(state.to_json(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            tmp_path.replace(self.path)
+            tmp.replace(self.path)
 
 
 # =========================
 # Вспомогательные функции
 # =========================
-def ensure_env() -> None:
-    placeholders = {"PUT_API_HASH_HERE", "PUT_BOT_TOKEN_HERE"}
-    if API_ID == 123456 or API_HASH in placeholders or BOT_TOKEN in placeholders:
-        raise RuntimeError(
-            "Заполните переменные окружения TG_API_ID, TG_API_HASH и TG_BOT_TOKEN."
-        )
-    if not ADMIN_USER_IDS:
-        raise RuntimeError("Укажите хотя бы один TG_ADMIN_USER_IDS для управления ботом.")
-
-
 def is_admin(sender_id: Optional[int]) -> bool:
     return sender_id is not None and sender_id in ADMIN_USER_IDS
 
@@ -169,87 +198,157 @@ async def safe_reply(event, text: str, buttons=None, parse_mode: Optional[str] =
     try:
         await event.reply(text, buttons=buttons, parse_mode=parse_mode)
     except FloodWaitError as exc:
-        logger.warning("FloodWait при ответе пользователю: %s сек.", exc.seconds)
         await asyncio.sleep(exc.seconds + 1)
         await event.reply(text, buttons=buttons, parse_mode=parse_mode)
     except Exception as exc:
-        logger.exception("Не удалось отправить ответ: %s", exc)
+        logger.warning("safe_reply error: %s", exc)
 
 
-async def resolve_target_chat_ids(client: TelegramClient, state: AppState) -> List[int]:
-    target_ids = set(ALLOWED_CHAT_IDS) if STRICT_ALLOWLIST_MODE else set(state.registered_chat_ids)
-    if not STRICT_ALLOWLIST_MODE:
-        target_ids.update(ALLOWED_CHAT_IDS)
-
-    valid_ids: List[int] = []
-    for chat_id in sorted(target_ids):
-        try:
-            await client.get_entity(chat_id)
-            valid_ids.append(chat_id)
-        except (PeerIdInvalidError, ChannelInvalidError, ChannelPrivateError, ValueError) as exc:
-            state.last_errors[str(chat_id)] = f"Чат недоступен или некорректен: {exc}"
-            logger.warning("Исключаю chat_id=%s: %s", chat_id, exc)
-        except FloodWaitError as exc:
-            logger.warning("FloodWait при проверке chat_id=%s: %s", chat_id, exc.seconds)
-            await asyncio.sleep(exc.seconds + 1)
-            valid_ids.append(chat_id)
-        except Exception as exc:
-            state.last_errors[str(chat_id)] = f"Ошибка проверки чата: {exc}"
-            logger.exception("Не удалось проверить chat_id=%s", chat_id)
-    return valid_ids
-
-
-async def send_message_to_chat(client: TelegramClient, chat_id: int, text: str) -> Optional[str]:
+async def safe_edit(event, text: str, buttons=None, parse_mode: Optional[str] = "html") -> None:
     try:
-        await client.send_message(chat_id, text)
-        return None
+        await event.edit(text, buttons=buttons, parse_mode=parse_mode)
+    except MessageNotModifiedError:
+        return
     except FloodWaitError as exc:
-        logger.warning("FloodWait при отправке в %s: ждать %s сек.", chat_id, exc.seconds)
         await asyncio.sleep(exc.seconds + 1)
+        await event.edit(text, buttons=buttons, parse_mode=parse_mode)
+    except Exception as exc:
+        logger.warning("safe_edit error: %s", exc)
+
+
+async def leave_chat(client: TelegramClient, chat_id: int, state: AppState) -> None:
+    if chat_id in state.banned_chats:
+        return
+    try:
+        entity = await client.get_entity(chat_id)
+        await client(DeleteHistoryRequest(peer=entity, max_id=0, just_clear=False))
+        state.banned_chats.add(chat_id)
+        await state.store.save(state)
+        logger.info("Покинул чат %s", chat_id)
+    except Exception as exc:
+        logger.warning("Не удалось покинуть чат %s: %s", chat_id, exc)
+
+
+async def get_all_dialogs(client: TelegramClient, state: AppState) -> List[Tuple[int, Any]]:
+    dialogs = await client.get_dialogs(limit=None)
+    result: List[Tuple[int, Any]] = []
+    for dialog in dialogs:
+        entity = dialog.entity
+        chat_id = getattr(entity, "id", None)
+        if not chat_id or chat_id in EXCLUDED_CHAT_IDS or chat_id in state.banned_chats:
+            continue
+
+        if isinstance(entity, Chat):
+            result.append((chat_id, entity))
+            continue
+
+        if isinstance(entity, Channel) and getattr(entity, "megagroup", False):
+            result.append((chat_id, entity))
+            continue
+
+    return result
+
+
+async def get_target_chat_ids(client: TelegramClient, state: AppState) -> List[int]:
+    target: Set[int] = set()
+    if SEND_TO_ALL_BY_DEFAULT:
+        dialogs = await get_all_dialogs(client, state)
+        target.update([chat_id for chat_id, _ in dialogs])
+    else:
+        target.update(ALLOWED_CHAT_IDS)
+
+    target.update(state.manual_chat_ids)
+    target -= state.banned_chats
+    return sorted(target)
+
+
+async def send_message_to_chat(
+    client: TelegramClient,
+    chat_id: int,
+    text: str,
+    state: AppState,
+) -> Tuple[Optional[str], bool]:
+    """
+    Возвращает (ошибка, нужно_ли_ждать_обычную_задержку)
+    """
+    for attempt in range(1, FLOOD_RETRY_CAP + 1):
         try:
             await client.send_message(chat_id, text)
-            return None
-        except Exception as retry_exc:
-            return f"Не удалось после FloodWait: {retry_exc}"
-    except (
-        ChatAdminRequiredError,
-        UserBannedInChannelError,
-        UserIsBlockedError,
-        InputUserDeactivatedError,
-        PeerIdInvalidError,
-        ChannelInvalidError,
-        ChannelPrivateError,
-    ) as exc:
-        return f"Нет прав или чат недоступен: {exc}"
-    except (OSError, asyncio.TimeoutError) as exc:
-        return f"Сетевая ошибка: {exc}"
-    except RPCError as exc:
-        return f"Telegram RPC ошибка: {exc}"
-    except Exception as exc:
-        logger.exception("Непредвиденная ошибка при отправке в %s", chat_id)
-        return f"Непредвиденная ошибка: {exc}"
+            return None, True
+        except FloodWaitError as exc:
+            state.stats.flood_hits += 1
+            random_jitter = random.uniform(0.85, 1.20)
+            backoff = min(
+                exc.seconds,
+                int((FLOOD_RETRY_BASE * (2 ** (attempt - 1))) * random_jitter),
+            )
+            backoff = max(1, backoff)
+            logger.warning(
+                "FloodWait в чате %s: %s сек, попытка %s/%s, пауза %s сек",
+                chat_id,
+                exc.seconds,
+                attempt,
+                FLOOD_RETRY_CAP,
+                backoff,
+            )
+            await state.store.save(state)
+            await asyncio.sleep(backoff)
+            continue
+        except (
+            ChatAdminRequiredError,
+            UserBannedInChannelError,
+            UserIsBlockedError,
+            InputUserDeactivatedError,
+        ):
+            await leave_chat(client, chat_id, state)
+            state.stats.send_errors += 1
+            return "Нет прав, чат покинут", False
+        except (ChannelInvalidError, ChannelPrivateError, PeerIdInvalidError):
+            await leave_chat(client, chat_id, state)
+            state.stats.send_errors += 1
+            return "Чат недоступен", False
+        except RPCError as exc:
+            state.stats.send_errors += 1
+            if "you can't write" in str(exc).lower() or "banned" in str(exc).lower():
+                await leave_chat(client, chat_id, state)
+                return "Нет прав", False
+            return f"RPC ошибка: {exc}", False
+        except Exception as exc:
+            state.stats.send_errors += 1
+            return f"Ошибка: {exc}", False
+
+    state.stats.send_errors += 1
+    return f"FloodWait не устранён после {FLOOD_RETRY_CAP} попыток", False
 
 
 def format_status(state: AppState) -> str:
-    mode = "allowlist" if STRICT_ALLOWLIST_MODE else "registered+allowlist"
-    targets = sorted(ALLOWED_CHAT_IDS if STRICT_ALLOWLIST_MODE else (state.registered_chat_ids | ALLOWED_CHAT_IDS))
-    errors = "\n".join(f"• {chat_id}: {msg}" for chat_id, msg in list(state.last_errors.items())[-10:]) or "нет"
+    mode = "все чаты" if SEND_TO_ALL_BY_DEFAULT else f"только разрешённые: {sorted(ALLOWED_CHAT_IDS)}"
+    banned = f"{len(state.banned_chats)}"
+    recent_errors = "\n".join(
+        [f"• {k}: {v}" for k, v in list(state.last_errors.items())[-10:]]
+    ) or "нет"
+
     return (
         "<b>Текущее состояние</b>\n"
         f"Рассылка: <b>{'включена' if state.sending_enabled else 'выключена'}</b>\n"
-        f"Интервал: <b>{state.interval_seconds}</b> сек.\n"
-        f"Режим чатов: <b>{mode}</b>\n"
-        f"Цели: <code>{targets}</code>\n"
-        f"Текст: <code>{state.message_text}</code>\n"
-        f"Ошибки: \n{errors}"
+        f"Интервал циклов: <b>{state.interval_seconds}</b> сек\n"
+        f"Пауза между отправками: <b>{SEND_DELAY_RANGE[0]}-{SEND_DELAY_RANGE[1]}</b> сек\n"
+        f"Режим: <b>{mode}</b>\n"
+        f"Забаненные чаты: <b>{banned}</b>\n"
+        f"Текст: <code>{state.message_text}</code>\n\n"
+        "<b>Статистика</b>\n"
+        f"✅ Успешно отправлено: <b>{state.stats.sent_ok}</b>\n"
+        f"❌ Ошибок отправки: <b>{state.stats.send_errors}</b>\n"
+        f"⏳ FloodWait событий: <b>{state.stats.flood_hits}</b>\n"
+        f"🔁 Циклов рассылки: <b>{state.stats.cycles_total}</b>\n\n"
+        f"<b>Последние ошибки</b>\n{recent_errors}"
     )
 
 
 def main_menu_buttons() -> List[List[Button]]:
     return [
         [Button.inline("▶️ Старт", b"start_send"), Button.inline("⏹ Стоп", b"stop_send")],
-        [Button.inline("📄 Статус", b"show_status"), Button.inline("🗑 Очистить ошибки", b"clear_errors")],
-        [Button.inline("🧹 Удалить state.json", b"delete_state")],
+        [Button.inline("📄 Статус", b"show_status")],
     ]
 
 
@@ -262,31 +361,41 @@ async def scheduler_loop(client: TelegramClient, store: StateStore) -> None:
             continue
 
         state.last_cycle_started_at = time.time()
-        target_ids = await resolve_target_chat_ids(client, state)
+        state.stats.cycles_total += 1
+        target_ids = await get_target_chat_ids(client, state)
         if not target_ids:
-            logger.warning("Нет доступных чатов для рассылки")
-            state.last_errors["general"] = "Нет доступных чатов для рассылки"
+            logger.warning("Нет доступных чатов")
             state.sending_enabled = False
+            state.last_errors["general"] = "Нет доступных чатов для рассылки"
             await store.save(state)
             await asyncio.sleep(2)
             continue
 
-        logger.info("Начинаю цикл рассылки по %s чатам", len(target_ids))
+        logger.info("Рассылка по %s чатам", len(target_ids))
         for chat_id in target_ids:
-            error = await send_message_to_chat(client, chat_id, state.message_text)
+            error, need_delay = await send_message_to_chat(
+                client,
+                chat_id,
+                state.message_text,
+                state,
+            )
             state = await store.load()
             if error:
                 state.last_errors[str(chat_id)] = error
-                logger.warning("Ошибка отправки в %s: %s", chat_id, error)
+                logger.warning("Ошибка в %s: %s", chat_id, error)
             else:
                 state.last_errors.pop(str(chat_id), None)
-                logger.info("Отправлено в chat_id=%s", chat_id)
+                state.stats.sent_ok += 1
+                logger.info("Отправлено в %s", chat_id)
             await store.save(state)
-            await asyncio.sleep(1)
+
+            if need_delay:
+                await asyncio.sleep(random.randint(*SEND_DELAY_RANGE))
 
         state = await store.load()
         await store.save(state)
-        await asyncio.sleep(max(10, state.interval_seconds))
+        cycle_pause = max(10, int(state.interval_seconds * random.uniform(*CYCLE_DELAY_JITTER)))
+        await asyncio.sleep(cycle_pause)
 
 
 async def handle_admin_message(event, client: TelegramClient, store: StateStore) -> None:
@@ -300,16 +409,15 @@ async def handle_admin_message(event, client: TelegramClient, store: StateStore)
     if text == "/start":
         await safe_reply(
             event,
-            "Управление рассылкой. Доступны команды:\n"
-            "/status\n"
-            "/run\n"
-            "/stop\n"
-            "/settext <текст>\n"
-            "/setinterval <секунды>\n"
-            "/register_chat <chat_id>\n"
-            "/unregister_chat <chat_id>\n"
-            "/delete_state\n"
-            "/delete_session\n",
+            "Управление рассылкой.\n"
+            "/status — состояние и статистика\n"
+            "/run — включить\n"
+            "/stop — выключить\n"
+            "/text <текст> — изменить текст\n"
+            "/setinterval <сек> — интервал цикла\n"
+            "/addchat <id> — вручную добавить чат\n"
+            "/listchats — список первых 100 чатов\n"
+            "/delete_session — удалить сессии и выйти",
             buttons=main_menu_buttons(),
         )
         return
@@ -321,92 +429,69 @@ async def handle_admin_message(event, client: TelegramClient, store: StateStore)
     if text == "/run":
         state.sending_enabled = True
         await store.save(state)
-        await safe_reply(event, "Рассылка включена.", buttons=main_menu_buttons())
+        await safe_reply(event, "Рассылка включена.")
         return
 
     if text == "/stop":
         state.sending_enabled = False
         await store.save(state)
-        await safe_reply(event, "Рассылка остановлена.", buttons=main_menu_buttons())
+        await safe_reply(event, "Рассылка остановлена.")
         return
 
-    if text.startswith("/settext "):
-        new_text = text[len("/settext "):].strip()
-        if not new_text:
-            await safe_reply(event, "Текст не должен быть пустым.")
-            return
-        state.message_text = new_text
-        await store.save(state)
-        await safe_reply(event, "Текст обновлён.")
+    if text.startswith("/text "):
+        new_text = text[len("/text ") :].strip()
+        if new_text:
+            state.message_text = new_text
+            await store.save(state)
+            await safe_reply(event, "Текст обновлён.")
         return
 
     if text.startswith("/setinterval "):
-        raw = text[len("/setinterval "):].strip()
         try:
-            seconds = int(raw)
-            if seconds < 10:
-                raise ValueError
-        except ValueError:
-            await safe_reply(event, "Интервал должен быть целым числом не меньше 10 секунд.")
-            return
-        state.interval_seconds = seconds
-        await store.save(state)
-        await safe_reply(event, f"Интервал обновлён: {seconds} сек.")
+            seconds = int(text[len("/setinterval ") :].strip())
+            if seconds >= 10:
+                state.interval_seconds = seconds
+                await store.save(state)
+                await safe_reply(event, f"Интервал: {seconds} сек.")
+            else:
+                await safe_reply(event, "Интервал должен быть >= 10 сек.")
+        except Exception:
+            await safe_reply(event, "Некорректный интервал.")
         return
 
-    if text.startswith("/register_chat "):
-        if STRICT_ALLOWLIST_MODE:
-            await safe_reply(event, "Сейчас включён STRICT_ALLOWLIST_MODE=true, регистрация отключена.")
-            return
-        raw = text[len("/register_chat "):].strip()
+    if text.startswith("/addchat "):
         try:
-            chat_id = int(raw)
+            chat_id = int(text[len("/addchat ") :].strip())
             await client.get_entity(chat_id)
+            state.manual_chat_ids.add(chat_id)
+            await store.save(state)
+            await safe_reply(event, f"Чат {chat_id} добавлен.")
         except Exception as exc:
-            await safe_reply(event, f"Не удалось проверить chat_id: {exc}")
-            return
-        state.registered_chat_ids.add(chat_id)
-        await store.save(state)
-        await safe_reply(event, f"Чат {chat_id} зарегистрирован.")
+            await safe_reply(event, f"Ошибка: {exc}")
         return
 
-    if text.startswith("/unregister_chat "):
-        raw = text[len("/unregister_chat "):].strip()
+    if text == "/listchats":
         try:
-            chat_id = int(raw)
-        except ValueError:
-            await safe_reply(event, "Укажите корректный chat_id.")
-            return
-        state.registered_chat_ids.discard(chat_id)
-        await store.save(state)
-        await safe_reply(event, f"Чат {chat_id} удалён из регистрации.")
-        return
-
-    if text == "/delete_state":
-        try:
-            if STATE_FILE.exists():
-                STATE_FILE.unlink()
-            await safe_reply(event, "Файл состояния удалён. При следующем действии будет создан заново.")
-        except OSError as exc:
-            await safe_reply(event, f"Не удалось удалить state.json: {exc}")
+            dialogs = await client.get_dialogs(limit=100)
+            lines = []
+            for d in dialogs:
+                entity = d.entity
+                chat_id = getattr(entity, "id", None)
+                name = getattr(d, "name", "")
+                if chat_id:
+                    lines.append(f"{chat_id} ({name})")
+            await safe_reply(event, "Диалоги (первые 100):\n" + "\n".join(lines))
+        except Exception as exc:
+            await safe_reply(event, f"Ошибка получения списка чатов: {exc}")
         return
 
     if text == "/delete_session":
-        await client.disconnect()
-        session_path = Path(f"{SESSION_NAME}.session")
-        session_journal = Path(f"{SESSION_NAME}.session-journal")
-        errors = []
-        for path in (session_path, session_journal):
-            try:
-                if path.exists():
-                    path.unlink()
-            except OSError as exc:
-                errors.append(f"{path}: {exc}")
-        if errors:
-            print("\n".join(errors), file=sys.stderr)
+        for pattern in (f"{SESSION_NAME}*", "control_bot_session*"):
+            for file_path in Path(".").glob(pattern):
+                with contextlib.suppress(Exception):
+                    file_path.unlink()
+        await safe_reply(event, "Сессия удалена. Перезапустите скрипт.")
         sys.exit(0)
-
-    await safe_reply(event, "Неизвестная команда. Нажмите /start для справки.")
 
 
 async def handle_callback(event, store: StateStore) -> None:
@@ -420,84 +505,100 @@ async def handle_callback(event, store: StateStore) -> None:
     if data == "start_send":
         state.sending_enabled = True
         await store.save(state)
-        await event.edit("Рассылка включена.", buttons=main_menu_buttons())
-        return
-
-    if data == "stop_send":
+        await safe_edit(event, "Рассылка включена.", buttons=main_menu_buttons())
+    elif data == "stop_send":
         state.sending_enabled = False
         await store.save(state)
-        await event.edit("Рассылка остановлена.", buttons=main_menu_buttons())
-        return
-
-    if data == "show_status":
-        await event.edit(format_status(state), buttons=main_menu_buttons(), parse_mode="html")
-        return
-
-    if data == "clear_errors":
-        state.last_errors.clear()
-        await store.save(state)
-        await event.edit("Ошибки очищены.", buttons=main_menu_buttons())
-        return
-
-    if data == "delete_state":
-        try:
-            if STATE_FILE.exists():
-                STATE_FILE.unlink()
-            await event.edit("state.json удалён.", buttons=main_menu_buttons())
-        except OSError as exc:
-            await event.edit(f"Ошибка удаления state.json: {exc}", buttons=main_menu_buttons())
-        return
-
-    await event.answer("Неизвестное действие", alert=True)
+        await safe_edit(event, "Рассылка остановлена.", buttons=main_menu_buttons())
+    elif data == "show_status":
+        await safe_edit(
+            event,
+            format_status(state),
+            buttons=main_menu_buttons(),
+            parse_mode="html",
+        )
 
 
-async def run() -> None:
-    ensure_env()
-    store = StateStore(STATE_FILE)
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+def get_proxy() -> Optional[Dict[str, Any]]:
+    if not PROXY_ENABLED:
+        return None
 
-    try:
-        await client.start(bot_token=BOT_TOKEN)
-    except SessionPasswordNeededError:
-        raise RuntimeError("Для bot_token не должна требоваться 2FA-пароль.")
-    except Exception as exc:
-        raise RuntimeError(f"Не удалось запустить Telethon client: {exc}") from exc
+    if PROXY_TYPE in {"socks5", "http"}:
+        proxy: Dict[str, Any] = {
+            "proxy_type": PROXY_TYPE,
+            "addr": PROXY_HOST,
+            "port": PROXY_PORT,
+        }
+        if PROXY_USER:
+            proxy["username"] = PROXY_USER
+            proxy["password"] = PROXY_PASS
+        return proxy
 
+    if PROXY_TYPE == "mtproto":
+        secret = bytes.fromhex(MT_PROXY_SECRET) if MT_PROXY_SECRET else None
+        return {
+            "proxy_type": "mtproto",
+            "addr": PROXY_HOST,
+            "port": PROXY_PORT,
+            "secret": secret,
+        }
+
+    raise ValueError(f"Неизвестный тип прокси: {PROXY_TYPE}")
+
+
+async def main() -> None:
+    proxy_config = get_proxy()
+
+    client = TelegramClient(
+        SESSION_NAME,
+        API_ID,
+        API_HASH,
+        connection=CONNECTION,
+        proxy=proxy_config,
+    )
+    await client.start()
     me = await client.get_me()
-    logger.info("Бот авторизован: @%s (%s)", getattr(me, "username", None), me.id)
+    logger.info("Авторизован user: %s (@%s)", me.first_name or me.username, me.username)
 
-    @client.on(events.NewMessage(pattern=None))
-    async def on_new_message(event):
-        try:
-            await handle_admin_message(event, client, store)
-        except Exception as exc:
-            logger.exception("Ошибка в обработчике сообщений: %s", exc)
-            await safe_reply(event, f"Внутренняя ошибка: {exc}")
+    control_bot = TelegramClient(
+        "control_bot_session",
+        API_ID,
+        API_HASH,
+        connection=CONNECTION,
+        proxy=proxy_config,
+    )
+    await control_bot.start(bot_token=CONTROL_BOT_TOKEN)
+    bot_me = await control_bot.get_me()
+    logger.info("Бот @%s запущен", bot_me.username)
 
-    @client.on(events.CallbackQuery())
+    store = StateStore(STATE_FILE)
+    await store.load()
+    await store.save(store.state)
+
+    @control_bot.on(events.NewMessage)
+    async def on_message(event):
+        await handle_admin_message(event, client, store)
+
+    @control_bot.on(events.CallbackQuery)
     async def on_callback(event):
-        try:
-            await handle_callback(event, store)
-        except Exception as exc:
-            logger.exception("Ошибка в callback-обработчике: %s", exc)
-            await event.answer(f"Внутренняя ошибка: {exc}", alert=True)
+        await handle_callback(event, store)
 
     scheduler_task = asyncio.create_task(scheduler_loop(client, store))
+
     try:
-        await client.run_until_disconnected()
+        await control_bot.run_until_disconnected()
     finally:
         scheduler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await scheduler_task
+        await client.disconnect()
 
 
 if __name__ == "__main__":
-    import contextlib
-
     try:
-        asyncio.run(run())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Остановлено пользователем")
+        logger.info("Остановлено")
     except Exception as exc:
-        logger.exception("Критическая ошибка: %s", exc)
+        logger.exception("Ошибка: %s", exc)
         sys.exit(1)
