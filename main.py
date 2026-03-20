@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -33,7 +34,6 @@ from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.network.connection.tcpmtproxy import (
     ConnectionTcpMTProxyRandomizedIntermediate,
 )
-from telethon.tl.functions.messages import DeleteHistoryRequest
 from telethon.tl.types import Channel, Chat
 
 # =========================
@@ -64,10 +64,10 @@ FLOOD_RETRY_CAP = 5
 
 PROXY_ENABLED = True
 PROXY_TYPE = "http"  # http, socks5, mtproto
-PROXY_HOST = "194.147.115.50"
-PROXY_PORT = 3128
-PROXY_USER = ""
-PROXY_PASS = ""
+PROXY_HOST = "168.81.42.248"
+PROXY_PORT = 8000
+PROXY_USER = "rVStJW"
+PROXY_PASS = "fsv2jZ"
 MT_PROXY_SECRET = ""
 
 if PROXY_ENABLED and PROXY_TYPE == "mtproto":
@@ -81,6 +81,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("telegram_scheduler")
 logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
+
+
+def _dialog_name(entity: Any) -> str:
+    title = getattr(entity, "title", None)
+    if title:
+        return str(title)
+    first_name = getattr(entity, "first_name", None)
+    last_name = getattr(entity, "last_name", None)
+    username = getattr(entity, "username", None)
+    full_name = " ".join(part for part in [first_name, last_name] if part)
+    if full_name:
+        return full_name
+    if username:
+        return f"@{username}"
+    return str(getattr(entity, "id", "unknown"))
 
 
 # =========================
@@ -221,12 +236,24 @@ async def leave_chat(client: TelegramClient, chat_id: int, state: AppState) -> N
         return
     try:
         entity = await client.get_entity(chat_id)
-        await client(DeleteHistoryRequest(peer=entity, max_id=0, just_clear=False))
+        chat_name = _dialog_name(entity)
+        # delete_dialog надёжнее для разных peer-типов, чем прямой DeleteHistoryRequest.
+        await client.delete_dialog(entity, revoke=True)
         state.banned_chats.add(chat_id)
         await state.store.save(state)
-        logger.info("Покинул чат %s", chat_id)
+        logger.info("Покинул чат %s (%s)", chat_id, chat_name)
+    except PeerIdInvalidError as exc:
+        # Даже если выйти не удалось, помечаем как banned,
+        # чтобы больше не пытаться отправлять в этот chat_id.
+        state.banned_chats.add(chat_id)
+        await state.store.save(state)
+        logger.warning(
+            "Чат %s исключён из рассылки (невалидный peer при выходе): %s",
+            chat_id,
+            exc,
+        )
     except Exception as exc:
-        logger.warning("Не удалось покинуть чат %s: %s", chat_id, exc)
+        logger.warning("Не удалось покинуть/скрыть чат %s: %s", chat_id, exc)
 
 
 async def get_all_dialogs(client: TelegramClient, state: AppState) -> List[Tuple[int, Any]]:
@@ -308,6 +335,24 @@ async def send_message_to_chat(
             state.stats.send_errors += 1
             return "Чат недоступен", False
         except RPCError as exc:
+            # На части версий/кейсов Telethon Telegram возвращает FLOOD как RPCError.
+            flood_match = re.search(r"wait of (\\d+) seconds", str(exc), flags=re.IGNORECASE)
+            if flood_match:
+                state.stats.flood_hits += 1
+                wait_seconds = int(flood_match.group(1))
+                wait_seconds = max(1, wait_seconds)
+                # Не спим тысячи секунд в одном чате — ограничиваем локальную паузу
+                # и продолжаем рассылку по другим чатам.
+                capped_wait = min(wait_seconds, 20)
+                logger.warning(
+                    "Flood-like RPC в чате %s: telegram_wait=%s сек, локальная пауза=%s сек",
+                    chat_id,
+                    wait_seconds,
+                    capped_wait,
+                )
+                await state.store.save(state)
+                await asyncio.sleep(capped_wait)
+                continue
             state.stats.send_errors += 1
             if "you can't write" in str(exc).lower() or "banned" in str(exc).lower():
                 await leave_chat(client, chat_id, state)
@@ -373,6 +418,11 @@ async def scheduler_loop(client: TelegramClient, store: StateStore) -> None:
 
         logger.info("Рассылка по %s чатам", len(target_ids))
         for chat_id in target_ids:
+            chat_entity = None
+            chat_name = str(chat_id)
+            with contextlib.suppress(Exception):
+                chat_entity = await client.get_entity(chat_id)
+                chat_name = _dialog_name(chat_entity)
             error, need_delay = await send_message_to_chat(
                 client,
                 chat_id,
@@ -382,11 +432,11 @@ async def scheduler_loop(client: TelegramClient, store: StateStore) -> None:
             state = await store.load()
             if error:
                 state.last_errors[str(chat_id)] = error
-                logger.warning("Ошибка в %s: %s", chat_id, error)
+                logger.warning("Ошибка в %s (%s): %s", chat_id, chat_name, error)
             else:
                 state.last_errors.pop(str(chat_id), None)
                 state.stats.sent_ok += 1
-                logger.info("Отправлено в %s", chat_id)
+                logger.info("Отправлено в %s (%s)", chat_id, chat_name)
             await store.save(state)
 
             if need_delay:
