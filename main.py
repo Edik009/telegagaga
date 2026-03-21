@@ -83,6 +83,18 @@ logger = logging.getLogger("telegram_scheduler")
 logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
 
 
+def should_reset_session(argv: List[str]) -> bool:
+    return "-s" in argv or "--new-session" in argv
+
+
+def reset_sessions() -> None:
+    for pattern in (f"{SESSION_NAME}*", "control_bot_session*"):
+        for file_path in Path(".").glob(pattern):
+            with contextlib.suppress(Exception):
+                file_path.unlink()
+                logger.warning("Удалён файл сессии: %s", file_path)
+
+
 def _dialog_name(entity: Any) -> str:
     title = getattr(entity, "title", None)
     if title:
@@ -597,6 +609,10 @@ def get_proxy() -> Optional[Dict[str, Any]]:
 
 
 async def main() -> None:
+    if should_reset_session(sys.argv[1:]):
+        logger.warning("Запрошен сброс сессии через флаг -s/--new-session")
+        reset_sessions()
+
     proxy_config = get_proxy()
 
     client = TelegramClient(
